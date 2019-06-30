@@ -2,95 +2,119 @@
 
 namespace ScoutElastic\Console;
 
-use ScoutElastic\Facades\ElasticClient;
 use Exception;
+use LogicException;
+use ScoutElastic\Migratable;
+use Illuminate\Console\Command;
+use ScoutElastic\Payloads\RawPayload;
+use ScoutElastic\Facades\ElasticClient;
+use ScoutElastic\Payloads\IndexPayload;
+use ScoutElastic\Console\Features\RequiresIndexConfiguratorArgument;
 
-class ElasticIndexUpdateCommand extends ElasticIndexCommand
+class ElasticIndexUpdateCommand extends Command
 {
+    use RequiresIndexConfiguratorArgument;
+
+    /**
+     * {@inheritdoc}
+     */
     protected $name = 'elastic:update-index';
 
+    /**
+     * {@inheritdoc}
+     */
     protected $description = 'Update settings and mappings of an Elasticsearch index';
 
-    protected function buildMappingPayload()
+    /**
+     * Update the index.
+     *
+     * @throws \Exception
+     * @return void
+     */
+    protected function updateIndex()
     {
-        $configurator = $this->getConfigurator();
+        $configurator = $this->getIndexConfigurator();
 
-        $defaultMapping = $configurator->getDefaultMapping();
-
-        if (!$defaultMapping) {
-            return null;
-        }
-
-        return array_merge(
-            $this->buildBasePayload(),
-            [
-                'type' => '_default_',
-                'body' => [
-                    '_default_' => $defaultMapping
-                ]
-            ]
-        );
-    }
-
-    protected function buildSettingsPayload()
-    {
-        $configurator = $this->getConfigurator();
-
-        $settings = $configurator->getSettings();
-
-        if (!$settings) {
-            return null;
-        }
-
-        return array_merge(
-            $this->buildBasePayload(),
-            [
-                'body' => [
-                    'settings' => $settings
-                ]
-            ]
-        );
-    }
-
-    public function fire()
-    {
-        $configurator = $this->getConfigurator();
-
-        $indexName = $configurator->getName();
-        $basePayload = $this->buildBasePayload();
+        $indexPayload = (new IndexPayload($configurator))->get();
 
         $indices = ElasticClient::indices();
 
-        if (!$indices->exists($basePayload)) {
-            $this->error(sprintf(
+        if (!$indices->exists($indexPayload)) {
+            throw new LogicException(sprintf(
                 'Index %s doesn\'t exist',
-                $indexName
+                $configurator->getName()
             ));
-
-            return;
         }
 
         try {
-            $indices->close($basePayload);
+            $indices->close($indexPayload);
 
-            if ($settingsPayload = $this->buildSettingsPayload()) {
-                $indices->putSettings($settingsPayload);
+            if ($settings = $configurator->getSettings()) {
+                $indexSettingsPayload = (new IndexPayload($configurator))
+                    ->set('body.settings', $settings)
+                    ->get();
+
+                $indices->putSettings($indexSettingsPayload);
             }
 
-            if ($mappingPayload = $this->buildMappingPayload()) {
-                $indices->putMapping($mappingPayload);
-            }
-
-            $indices->open($basePayload);
+            $indices->open($indexPayload);
         } catch (Exception $exception) {
-            $indices->open($basePayload);
+            $indices->open($indexPayload);
 
             throw $exception;
         }
 
         $this->info(sprintf(
             'The index %s was updated!',
-            $indexName
+            $configurator->getName()
         ));
+    }
+
+    /**
+     * Create a write alias.
+     *
+     * @return void
+     */
+    protected function createWriteAlias()
+    {
+        $configurator = $this->getIndexConfigurator();
+
+        if (!in_array(Migratable::class, class_uses_recursive($configurator))) {
+            return;
+        }
+
+        $indices = ElasticClient::indices();
+
+        $existsPayload = (new RawPayload())
+            ->set('name', $configurator->getWriteAlias())
+            ->get();
+
+        if ($indices->existsAlias($existsPayload)) {
+            return;
+        }
+
+        $putPayload = (new IndexPayload($configurator))
+            ->set('name', $configurator->getWriteAlias())
+            ->get();
+
+        $indices->putAlias($putPayload);
+
+        $this->info(sprintf(
+            'The %s alias for the %s index was created!',
+            $configurator->getWriteAlias(),
+            $configurator->getName()
+        ));
+    }
+
+    /**
+     * Handle the command.
+     *
+     * @var string
+     */
+    public function handle()
+    {
+        $this->updateIndex();
+
+        $this->createWriteAlias();
     }
 }

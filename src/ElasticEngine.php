@@ -2,224 +2,169 @@
 
 namespace ScoutElastic;
 
-use Config;
-use Artisan;
+use stdClass;
 use Laravel\Scout\Builder;
+use Illuminate\Support\Arr;
 use Laravel\Scout\Engines\Engine;
-use ScoutElastic\Builders\SearchBuilder;
-use ScoutElastic\Facades\ElasticClient;
-use Illuminate\Database\Eloquent\Collection;
+use ScoutElastic\Payloads\TypePayload;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Artisan;
+use ScoutElastic\Facades\ElasticClient;
+use ScoutElastic\Builders\SearchBuilder;
+use ScoutElastic\Indexers\IndexerInterface;
+use Illuminate\Database\Eloquent\Collection;
 
 class ElasticEngine extends Engine
 {
-    protected $updateMapping = false;
+    /**
+     * The indexer interface.
+     *
+     * @var \ScoutElastic\Indexers\IndexerInterface
+     */
+    protected $indexer;
 
-    public function __construct()
+    /**
+     * Should the mapping be updated.
+     *
+     * @var bool
+     */
+    protected $updateMapping;
+
+    /**
+     * The updated mappings.
+     *
+     * @var array
+     */
+    protected static $updatedMappings = [];
+
+    /**
+     * ElasticEngine constructor.
+     *
+     * @param \ScoutElastic\Indexers\IndexerInterface $indexer
+     * @param bool $updateMapping
+     * @return void
+     */
+    public function __construct(IndexerInterface $indexer, $updateMapping)
     {
-        $this->updateMapping = Config::get('scout_elastic.update_mapping');
+        $this->indexer = $indexer;
+
+        $this->updateMapping = $updateMapping;
     }
 
     /**
-     * @param SearchableModel $model
-     * @param mixed $bodyPayload
-     * @return array
+     * {@inheritdoc}
      */
-    protected function buildTypePayload($model, $bodyPayload = null)
-    {
-        $payload = [
-            'index' => $model->getIndexConfigurator()->getName(),
-            'type' => $model->searchableAs(),
-        ];
-
-        if ($bodyPayload) {
-            $payload['body'] = $bodyPayload;
-        }
-
-        return $payload;
-    }
-
-    /**
-     * @param SearchableModel $model
-     * @param mixed $bodyPayload
-     * @return array
-     */
-    protected function buildDocumentPayload($model, $bodyPayload = null)
-    {
-        return array_merge(
-            $this->buildTypePayload($model, $bodyPayload),
-            ['id' => $model->getKey()]
-        );
-    }
-
-    protected function buildFilterPayload(Builder $builder)
-    {
-        $payload = [];
-
-        foreach ($builder->wheres as $where) {
-            $must = null;
-            $mustNot = null;
-
-            /** @var string $field */
-            /** @var string $type */
-            /** @var string $operator */
-            /** @var mixed $value */
-            /** @var bool $not */
-            /** @var string $flags */
-            extract($where);
-
-            switch ($type) {
-                case 'basic':
-                    switch ($operator) {
-                        case '=':
-                            $must = ['term' => [$field => $value]];
-                            break;
-
-                        case '>':
-                            $must = ['range' => [$field => ['gt' => $value]]];
-                            break;
-
-                        case '<';
-                            $must = ['range' => [$field => ['lt' => $value]]];
-                            break;
-
-                        case '>=':
-                            $must = ['range' => [$field => ['gte' => $value]]];
-                            break;
-
-                        case '<=':
-                            $must = ['range' => [$field => ['lte' => $value]]];
-                            break;
-
-                        case '<>':
-                            $mustNot = ['term' => [$field => $value]];
-                            break;
-                    }
-                    break;
-
-                case 'in':
-                    if ($not) {
-                        $mustNot = ['terms' => [$field => $value]];
-                    } else {
-                        $must = ['terms' => [$field => $value]];
-                    }
-                    break;
-
-                case 'between':
-                    if ($not) {
-                        $mustNot = ['range' => [$field => ['gte' => $value[0], 'lte' => $value[1]]]];
-                    } else {
-                        $must = ['range' => [$field => ['gte' => $value[0], 'lte' => $value[1]]]];
-                    }
-                    break;
-
-                case 'exists':
-                    if ($not) {
-                        $mustNot = ['exists' => ['field' => $field]];
-                    } else {
-                        $must = ['exists' => ['field' => $field]];
-                    }
-                    break;
-
-                case 'regexp':
-                    $must = ['regexp' => [$field => ['value' => $value, 'flags' => $flags]]];
-                    break;
-            }
-
-            if ($must || $mustNot) {
-                if (!isset($payload['bool'])) {
-                    $payload['bool'] = [];
-                }
-
-                if ($must) {
-                    if (!isset($payload['bool']['must'])) {
-                        $payload['bool']['must'] = [];
-                    }
-
-                    $payload['bool']['must'][] = $must;
-                }
-
-                if ($mustNot) {
-                    if (!isset($payload['bool']['must_not'])) {
-                        $payload['bool']['must_not'] = [];
-                    }
-
-                    $payload['bool']['must_not'][] = $mustNot;
-                }
-            }
-        }
-
-        return $payload;
-    }
-
-    protected function buildSearchQueryPayload(Builder $builder, $queryPayload, array $options = [])
-    {
-        $payload = [
-            'query' => [
-                'bool' => $queryPayload
-            ]
-        ];
-
-        if ($filterPayload = $this->buildFilterPayload($builder)) {
-            $payload['query']['bool'] = array_merge_recursive(
-                $payload['query']['bool'],
-                ['filter' => $filterPayload]
-            );
-        }
-
-        if ($size = isset($options['limit']) ? $options['limit'] : $builder->limit) {
-            $payload['size'] = $size;
-
-            if (isset($options['page'])) {
-                $payload['from'] = ($options['page'] - 1) * $size;
-            }
-        }
-
-        if ($orders = $builder->orders) {
-            $payload['sort'] = [];
-
-            foreach ($orders as $order) {
-                $payload['sort'][] = [$order['column'] => $order['direction']];
-            }
-        }
-
-        return $this->buildTypePayload(
-            $builder->model,
-            $payload
-        );
-    }
-
     public function update($models)
     {
-        $models->map(function ($model) {
-            if ($this->updateMapping) {
+        if ($this->updateMapping) {
+            $self = $this;
+
+            $models->each(function ($model) use ($self) {
+                $modelClass = get_class($model);
+
+                if (in_array($modelClass, $self::$updatedMappings)) {
+                    return true;
+                }
+
                 Artisan::call(
                     'elastic:update-mapping',
-                    ['model' => get_class($model)]
+                    ['model' => $modelClass]
                 );
-            }
 
-            $payload = $this->buildDocumentPayload(
-                $model,
-                $model->toSearchableArray()
-            );
+                $self::$updatedMappings[] = $modelClass;
+            });
+        }
 
-            ElasticClient::index($payload);
-        });
-
-        $this->updateMapping = false;
+        $this
+            ->indexer
+            ->update($models);
     }
 
+    /**
+     * {@inheritdoc}
+     */
     public function delete($models)
     {
-        $models->map(function ($model) {
-            $payload = $this->buildDocumentPayload($model);
+        $this->indexer->delete($models);
+    }
 
-            ElasticClient::delete($payload);
+    /**
+     * Build the payload collection.
+     *
+     * @param \Laravel\Scout\Builder $builder
+     * @param array $options
+     * @return \Illuminate\Support\Collection
+     */
+    public function buildSearchQueryPayloadCollection(Builder $builder, array $options = [])
+    {
+        $payloadCollection = collect();
+
+        if ($builder instanceof SearchBuilder) {
+            $searchRules = $builder->rules ?: $builder->model->getSearchRules();
+
+            foreach ($searchRules as $rule) {
+                $payload = new TypePayload($builder->model);
+
+                if (is_callable($rule)) {
+                    $payload->setIfNotEmpty('body.query.bool', call_user_func($rule, $builder));
+                } else {
+                    /** @var SearchRule $ruleEntity */
+                    $ruleEntity = new $rule($builder);
+
+                    if ($ruleEntity->isApplicable()) {
+                        $payload->setIfNotEmpty('body.query.bool', $ruleEntity->buildQueryPayload());
+
+                        if ($options['highlight'] ?? true) {
+                            $payload->setIfNotEmpty('body.highlight', $ruleEntity->buildHighlightPayload());
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+
+                $payloadCollection->push($payload);
+            }
+        } else {
+            $payload = (new TypePayload($builder->model))
+                ->setIfNotEmpty('body.query.bool.must.match_all', new stdClass());
+
+            $payloadCollection->push($payload);
+        }
+
+        return $payloadCollection->map(function (TypePayload $payload) use ($builder, $options) {
+            $payload
+                ->setIfNotEmpty('body._source', $builder->select)
+                ->setIfNotEmpty('body.collapse.field', $builder->collapse)
+                ->setIfNotEmpty('body.sort', $builder->orders)
+                ->setIfNotEmpty('body.explain', $options['explain'] ?? null)
+                ->setIfNotEmpty('body.profile', $options['profile'] ?? null)
+                ->setIfNotNull('body.from', $builder->offset)
+                ->setIfNotNull('body.size', $builder->limit);
+
+            foreach ($builder->wheres as $clause => $filters) {
+                $clauseKey = 'body.query.bool.filter.bool.'.$clause;
+
+                $clauseValue = array_merge(
+                    $payload->get($clauseKey, []),
+                    $filters
+                );
+
+                $payload->setIfNotEmpty($clauseKey, $clauseValue);
+            }
+
+            return $payload->get();
         });
     }
 
-    protected function performSearch(Builder $builder, array $options = []) {
+    /**
+     * Perform the search.
+     *
+     * @param \Laravel\Scout\Builder $builder
+     * @param array $options
+     * @return array|mixed
+     */
+    protected function performSearch(Builder $builder, array $options = [])
+    {
         if ($builder->callback) {
             return call_user_func(
                 $builder->callback,
@@ -229,99 +174,181 @@ class ElasticEngine extends Engine
             );
         }
 
-        $results = null;
+        $results = [];
 
-        if ($builder instanceof SearchBuilder) {
-            $searchRules = $builder->rules ?: $builder->model->getSearchRules();
-
-            foreach ($searchRules as $rule) {
-                if (is_callable($rule)) {
-                    $queryPayload = call_user_func($rule, $builder);
-                } else {
-                    /** @var SearchRule $ruleEntity */
-                    $ruleEntity = new $rule($builder);
-
-                    if ($ruleEntity->isApplicable()) {
-                        $queryPayload = $ruleEntity->buildQueryPayload();
-                    } else {
-                        continue;
-                    }
-                }
-
-                $payload = $this->buildSearchQueryPayload(
-                    $builder,
-                    $queryPayload,
-                    $options
-                );
-
+        $this
+            ->buildSearchQueryPayloadCollection($builder, $options)
+            ->each(function ($payload) use (&$results) {
                 $results = ElasticClient::search($payload);
 
-                if ($this->getTotalCount($results) > 0) {
-                    return $results;
-                }
-            }
-        } else {
-            $payload = $this->buildSearchQueryPayload(
-                $builder,
-                ['must' => ['match_all' => new \stdClass()]],
-                $options
-            );
+                $results['_payload'] = $payload;
 
-            $results = ElasticClient::search($payload);
-        }
+                if ($this->getTotalCount($results) > 0) {
+                    return false;
+                }
+            });
 
         return $results;
     }
 
+    /**
+     * {@inheritdoc}
+     */
     public function search(Builder $builder)
     {
         return $this->performSearch($builder);
     }
 
+    /**
+     * {@inheritdoc}
+     */
     public function paginate(Builder $builder, $perPage, $page)
     {
+        $builder
+            ->from(($page - 1) * $perPage)
+            ->take($perPage);
+
+        return $this->performSearch($builder);
+    }
+
+    /**
+     * Explain the search.
+     *
+     * @param \Laravel\Scout\Builder $builder
+     * @return array|mixed
+     */
+    public function explain(Builder $builder)
+    {
         return $this->performSearch($builder, [
-            'limit' => $perPage,
-            'page' => $page
+            'explain' => true,
         ]);
     }
 
+    /**
+     * Profile the search.
+     *
+     * @param \Laravel\Scout\Builder $builder
+     * @return array|mixed
+     */
+    public function profile(Builder $builder)
+    {
+        return $this->performSearch($builder, [
+            'profile' => true,
+        ]);
+    }
+
+    /**
+     * Return the number of documents found.
+     *
+     * @param \Laravel\Scout\Builder $builder
+     * @return int
+     */
+    public function count(Builder $builder)
+    {
+        $count = 0;
+
+        $this
+            ->buildSearchQueryPayloadCollection($builder, ['highlight' => false])
+            ->each(function ($payload) use (&$count) {
+                $result = ElasticClient::count($payload);
+
+                $count = $result['count'];
+
+                if ($count > 0) {
+                    return false;
+                }
+            });
+
+        return $count;
+    }
+
+    /**
+     * Make a raw search.
+     *
+     * @param \Illuminate\Database\Eloquent\Model $model
+     * @param array $query
+     * @return mixed
+     */
     public function searchRaw(Model $model, $query)
     {
-        $payload = $this->buildTypePayload($model, $query);
+        $payload = (new TypePayload($model))
+            ->setIfNotEmpty('body', $query)
+            ->get();
+
         return ElasticClient::search($payload);
     }
 
+    /**
+     * {@inheritdoc}
+     */
     public function mapIds($results)
     {
-        return array_pluck($results['hits']['hits'], '_id');
+        return collect($results['hits']['hits'])->pluck('_id');
     }
 
-    public function map($results, $model)
+    /**
+     * {@inheritdoc}
+     */
+    public function map(Builder $builder, $results, $model)
     {
         if ($this->getTotalCount($results) == 0) {
             return Collection::make();
         }
 
-        $ids = $this->mapIds($results);
+        $scoutKeyName = $model->getScoutKeyName();
 
-        $modelKey = $model->getKeyName();
+        $columns = Arr::get($results, '_payload.body._source');
 
-        $models = $model->whereIn($modelKey, $ids)
-                        ->get()
-                        ->keyBy($modelKey);
+        if (is_null($columns)) {
+            $columns = ['*'];
+        } else {
+            $columns[] = $scoutKeyName;
+        }
 
-        return Collection::make($results['hits']['hits'])->map(function($hit) use ($models) {
-            $id = $hit['_id'];
+        $ids = $this->mapIds($results)->all();
 
-            if (isset($models[$id])) {
-                return $models[$id];
-            }
-        })->filter();
+        $query = $model::usesSoftDelete() ? $model->withTrashed() : $model->newQuery();
+
+        $models = $query
+            ->whereIn($scoutKeyName, $ids)
+            ->get($columns)
+            ->keyBy($scoutKeyName);
+
+        return Collection::make($results['hits']['hits'])
+            ->map(function ($hit) use ($models) {
+                $id = $hit['_id'];
+
+                if (isset($models[$id])) {
+                    $model = $models[$id];
+
+                    if (isset($hit['highlight'])) {
+                        $model->highlight = new Highlight($hit['highlight']);
+                    }
+
+                    return $model;
+                }
+            })
+            ->filter()
+            ->values();
     }
 
+    /**
+     * {@inheritdoc}
+     */
     public function getTotalCount($results)
     {
-        return $results['hits']['total'];
+        return $results['hits']['total']['value'];
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function flush($model)
+    {
+        $query = $model::usesSoftDelete() ? $model->withTrashed() : $model->newQuery();
+
+        $query
+            ->orderBy($model->getScoutKeyName())
+            ->unsearchable();
     }
 }

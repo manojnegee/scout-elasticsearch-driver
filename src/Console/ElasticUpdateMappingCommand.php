@@ -2,70 +2,63 @@
 
 namespace ScoutElastic\Console;
 
+use LogicException;
+use ScoutElastic\Migratable;
 use Illuminate\Console\Command;
+use ScoutElastic\Payloads\TypePayload;
 use ScoutElastic\Facades\ElasticClient;
-use ScoutElastic\SearchableModel;
-use Symfony\Component\Console\Input\InputArgument;
+use ScoutElastic\Console\Features\RequiresModelArgument;
 
 class ElasticUpdateMappingCommand extends Command
 {
+    use RequiresModelArgument;
+
+    /**
+     * {@inheritdoc}
+     */
     protected $name = 'elastic:update-mapping';
 
+    /**
+     * {@inheritdoc}
+     */
     protected $description = 'Update a model mapping';
 
     /**
-     * @return SearchableModel
+     * Handle the command.
+     *
+     * @return void
      */
-    protected function getModel()
+    public function handle()
     {
-        $model = trim($this->argument('model'));
-        return (new $model);
-    }
+        if (!$model = $this->getModel()) {
+            return;
+        }
 
-    protected function buildPayload()
-    {
-        $model = $this->getModel();
         $configurator = $model->getIndexConfigurator();
 
-        $mapping = [];
+        $mapping = array_merge_recursive(
+            $configurator->getDefaultMapping(),
+            $model->getMapping()
+        );
 
-        if ($defaultMapping = $configurator->getDefaultMapping()) {
-            $mapping = array_merge($mapping, $defaultMapping);
+        if (empty($mapping)) {
+            throw new LogicException('Nothing to update: the mapping is not specified.');
         }
 
-        if ($modelMapping = $model->getMapping()) {
-            $mapping = array_merge($mapping, $modelMapping);
+        $payload = (new TypePayload($model))
+            ->set('body.' . $model->searchableAs(), $mapping)
+            ->set('include_type_name', 'true');
+
+        if (in_array(Migratable::class, class_uses_recursive($configurator))) {
+            $payload->useAlias('write');
         }
 
-        if (!$mapping) {
-            return null;
-        }
-
-        return [
-            'index' => $configurator->getName(),
-            'type' => $model->searchableAs(),
-            'body' => [$model->searchableAs() => $mapping]
-        ];
-    }
-
-    public function fire() {
-        $model = $this->getModel();
-
-        if ($payload = $this->buildPayload()) {
-            ElasticClient::indices()
-                ->putMapping($payload);
-        }
+        ElasticClient::indices()
+            ->putMapping($payload->get());
 
         $this->info(sprintf(
             'The %s mapping was updated!',
             $model->searchableAs()
         ));
-    }
-
-    protected function getArguments()
-    {
-        return [
-            ['model', InputArgument::REQUIRED, 'The model class'],
-        ];
     }
 }
